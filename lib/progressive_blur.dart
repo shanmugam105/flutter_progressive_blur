@@ -44,44 +44,16 @@ class ProgressiveBlurWidget extends StatefulWidget {
   static const _shaderAssetKey =
       'packages/progressive_blur/lib/shaders/progressive_blur.frag';
 
-  static ui.FragmentProgram? _program;
-  static Future<void>? _programLoad;
-
-  /// Overrides the renderer used by the widget.
+  /// Uses a mask-layer approximation for Android [LinearGradientBlur] effects.
   ///
-  /// The default (`null`) uses [ui.ImageFilter.shader] on Android when the
-  /// engine supports it, and keeps the existing [AnimatedSampler] renderer on
-  /// other platforms. Set this to `false` to force the old renderer.
-  static bool? useImageFilter;
-
-  static bool get _shouldUseImageFilter {
-    if (useImageFilter case final override?) {
-      return override && ui.ImageFilter.isShaderFilterSupported;
-    }
-
-    return defaultTargetPlatform == TargetPlatform.android &&
-        ui.ImageFilter.isShaderFilterSupported;
-  }
-
-  static Future<void> _loadProgram() {
-    if (_program != null) {
-      return Future<void>.value();
-    }
-
-    return _programLoad ??= ui.FragmentProgram.fromAsset(_shaderAssetKey).then(
-      (program) {
-        _program = program;
-      },
-    );
-  }
+  /// This avoids Android shader artifacts caused by the two-pass variable blur
+  /// path. Set this to `false` if you need to compare against the shader path.
+  static bool useAndroidLayeredGradientBlur = true;
 
   /// Precaches the blur shader so that it can be used synchronously later.
   /// This should be called as early as possible in your app (e.g. in `main()`).
-  static Future<void> precache() async {
-    await Future.wait([
-      _loadProgram(),
-      ShaderBuilder.precacheShader(_shaderAssetKey),
-    ]);
+  static Future<void> precache() {
+    return ShaderBuilder.precacheShader(_shaderAssetKey);
   }
 
   /// A simple constructor that allows to specify a linear gradient blur.
@@ -112,13 +84,11 @@ class ProgressiveBlurWidget extends StatefulWidget {
 class _ProgressiveBlurWidgetState extends State<ProgressiveBlurWidget> {
   /// The blur texture that this widget manages.
   ui.Image? _managedBlurTexture;
-  Future<void>? _programLoad;
 
   @override
   void initState() {
     super.initState();
     _maybeCreateBlurTexture();
-    _maybeLoadProgram();
   }
 
   /// Disposes of the old blur texture and creates a new one if necessary.
@@ -157,23 +127,6 @@ class _ProgressiveBlurWidgetState extends State<ProgressiveBlurWidget> {
     if (shouldCreateBlurTexture) {
       _maybeCreateBlurTexture();
     }
-
-    _maybeLoadProgram();
-  }
-
-  void _maybeLoadProgram() {
-    if (!ProgressiveBlurWidget._shouldUseImageFilter ||
-        ProgressiveBlurWidget._program != null ||
-        _programLoad != null) {
-      return;
-    }
-
-    _programLoad = ProgressiveBlurWidget._loadProgram().whenComplete(() {
-      _programLoad = null;
-      if (mounted) {
-        setState(() {});
-      }
-    });
   }
 
   @override
@@ -186,23 +139,19 @@ class _ProgressiveBlurWidgetState extends State<ProgressiveBlurWidget> {
 
   @override
   Widget build(BuildContext context) {
-    if (ProgressiveBlurWidget._shouldUseImageFilter) {
-      final program = ProgressiveBlurWidget._program;
+    final linearGradientBlur = widget.linearGradientBlur;
 
-      if (program != null) {
-        return RepaintBoundary(
-          child: _ImageFilterProgressiveBlurWidget(
-            program: program,
-            blurTexture: blurTexture,
-            sigma: widget.sigma,
-            tintColor: widget.tintColor,
-            child: widget.child,
-          ),
-        );
-      }
-
-      _maybeLoadProgram();
-      return RepaintBoundary(child: widget.child);
+    if (defaultTargetPlatform == TargetPlatform.android &&
+        ProgressiveBlurWidget.useAndroidLayeredGradientBlur &&
+        linearGradientBlur != null) {
+      return RepaintBoundary(
+        child: _LayeredGradientProgressiveBlurWidget(
+          linearGradientBlur: linearGradientBlur,
+          sigma: widget.sigma,
+          tintColor: widget.tintColor,
+          child: widget.child,
+        ),
+      );
     }
 
     // The output texture should be scaled by the device pixel ratio.
@@ -265,97 +214,94 @@ class _ProgressiveBlurWidgetState extends State<ProgressiveBlurWidget> {
   }
 }
 
-class _ImageFilterProgressiveBlurWidget extends StatefulWidget {
-  const _ImageFilterProgressiveBlurWidget({
-    required this.program,
-    required this.blurTexture,
+class _LayeredGradientProgressiveBlurWidget extends StatelessWidget {
+  const _LayeredGradientProgressiveBlurWidget({
+    required this.linearGradientBlur,
     required this.sigma,
     required this.tintColor,
     required this.child,
   });
 
-  final ui.FragmentProgram program;
-  final ui.Image blurTexture;
+  static const _layerCount = 8;
+
+  final LinearGradientBlur linearGradientBlur;
   final double sigma;
   final Color tintColor;
   final Widget child;
 
   @override
-  State<_ImageFilterProgressiveBlurWidget> createState() =>
-      _ImageFilterProgressiveBlurWidgetState();
-}
+  Widget build(BuildContext context) {
+    final children = <Widget>[child];
 
-class _ImageFilterProgressiveBlurWidgetState
-    extends State<_ImageFilterProgressiveBlurWidget> {
-  ui.FragmentShader? _xShader;
-  ui.FragmentShader? _yShader;
-  ui.ImageFilter? _filter;
+    for (var i = 1; i <= _layerCount; i++) {
+      final lower = (i - 1) / _layerCount;
+      final upper = i / _layerCount;
+      final layerSigma = sigma * upper;
 
-  @override
-  void initState() {
-    super.initState();
-    _rebuildFilter();
-  }
-
-  @override
-  void didUpdateWidget(covariant _ImageFilterProgressiveBlurWidget oldWidget) {
-    super.didUpdateWidget(oldWidget);
-
-    if (widget.program != oldWidget.program ||
-        widget.blurTexture != oldWidget.blurTexture ||
-        widget.sigma != oldWidget.sigma ||
-        widget.tintColor != oldWidget.tintColor) {
-      _rebuildFilter();
+      children.add(
+        Positioned.fill(
+          child: ShaderMask(
+            blendMode: BlendMode.dstIn,
+            shaderCallback: (bounds) {
+              return _createLayerMask(lower, upper).createShader(bounds);
+            },
+            child: ClipRect(
+              child: ImageFiltered(
+                imageFilter: ui.ImageFilter.blur(
+                  sigmaX: layerSigma,
+                  sigmaY: layerSigma,
+                  tileMode: ui.TileMode.clamp,
+                ),
+                child: child,
+              ),
+            ),
+          ),
+        ),
+      );
     }
-  }
 
-  @override
-  void dispose() {
-    _xShader?.dispose();
-    _yShader?.dispose();
-    super.dispose();
-  }
+    if (tintColor.a > 0) {
+      children.add(
+        Positioned.fill(
+          child: IgnorePointer(
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: linearGradientBlur.start,
+                  end: linearGradientBlur.end,
+                  stops: linearGradientBlur.stops,
+                  colors: linearGradientBlur.values
+                      .map(
+                        (value) => tintColor.withValues(
+                          alpha: tintColor.a * value.clamp(0.0, 1.0),
+                        ),
+                      )
+                      .toList(),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    }
 
-  void _setUniforms(ui.FragmentShader shader, {required double direction}) {
-    // ImageFilter.shader supplies sampler 0 and floats 0-1 from the child.
-    shader.setImageSampler(1, widget.blurTexture);
-    shader.setFloat(2, widget.sigma);
-    shader.setFloat(3, direction);
-    shader.setFloat(4, widget.tintColor.r);
-    shader.setFloat(5, widget.tintColor.g);
-    shader.setFloat(6, widget.tintColor.b);
-    shader.setFloat(7, widget.tintColor.a);
-  }
-
-  void _rebuildFilter() {
-    _xShader?.dispose();
-    _yShader?.dispose();
-
-    final xShader = widget.program.fragmentShader();
-    final yShader = widget.program.fragmentShader();
-
-    _setUniforms(xShader, direction: 0.0);
-    _setUniforms(yShader, direction: 1.0);
-
-    _xShader = xShader;
-    _yShader = yShader;
-    _filter = ui.ImageFilter.compose(
-      outer: ui.ImageFilter.shader(yShader),
-      inner: ui.ImageFilter.shader(xShader),
+    return Stack(
+      fit: StackFit.passthrough,
+      children: children,
     );
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final filter = _filter;
+  LinearGradient _createLayerMask(double lower, double upper) {
+    return LinearGradient(
+      begin: linearGradientBlur.start,
+      end: linearGradientBlur.end,
+      stops: linearGradientBlur.stops,
+      colors: linearGradientBlur.values.map((value) {
+        final normalized = ((value - lower) / (upper - lower)).clamp(0.0, 1.0);
+        final alpha = (normalized * 255).round();
 
-    if (filter == null) {
-      return widget.child;
-    }
-
-    return ImageFiltered(
-      imageFilter: filter,
-      child: widget.child,
+        return Color.fromARGB(alpha, 255, 255, 255);
+      }).toList(),
     );
   }
 }
