@@ -223,6 +223,7 @@ class _LayeredGradientProgressiveBlurWidget extends StatelessWidget {
   });
 
   static const _layerCount = 8;
+  static const _gradientSampleCount = 48;
 
   final LinearGradientBlur linearGradientBlur;
   final double sigma;
@@ -234,16 +235,15 @@ class _LayeredGradientProgressiveBlurWidget extends StatelessWidget {
     final children = <Widget>[child];
 
     for (var i = 1; i <= _layerCount; i++) {
-      final lower = (i - 1) / _layerCount;
-      final upper = i / _layerCount;
-      final layerSigma = sigma * upper;
+      final layerStrength = i / _layerCount;
+      final layerSigma = sigma * layerStrength;
 
       children.add(
         Positioned.fill(
           child: ShaderMask(
             blendMode: BlendMode.dstIn,
             shaderCallback: (bounds) {
-              return _createLayerMask(lower, upper).createShader(bounds);
+              return _createLayerMask(layerStrength).createShader(bounds);
             },
             child: ClipRect(
               child: ImageFiltered(
@@ -269,14 +269,12 @@ class _LayeredGradientProgressiveBlurWidget extends StatelessWidget {
                 gradient: LinearGradient(
                   begin: linearGradientBlur.start,
                   end: linearGradientBlur.end,
-                  stops: linearGradientBlur.stops,
-                  colors: linearGradientBlur.values
-                      .map(
-                        (value) => tintColor.withValues(
-                          alpha: tintColor.a * _shaderStrength(value),
-                        ),
-                      )
-                      .toList(),
+                  stops: _sampledStops,
+                  colors: _sampledStrengths.map((strength) {
+                    return tintColor.withValues(
+                      alpha: tintColor.a * strength,
+                    );
+                  }).toList(),
                 ),
               ),
             ),
@@ -291,21 +289,71 @@ class _LayeredGradientProgressiveBlurWidget extends StatelessWidget {
     );
   }
 
-  LinearGradient _createLayerMask(double lower, double upper) {
+  LinearGradient _createLayerMask(double layerStrength) {
     return LinearGradient(
       begin: linearGradientBlur.start,
       end: linearGradientBlur.end,
-      stops: linearGradientBlur.stops,
-      colors: linearGradientBlur.values.map((value) {
-        final strength = _shaderStrength(value);
-        final normalized = ((strength - lower) / (upper - lower)).clamp(
-          0.0,
-          1.0,
-        );
-        final alpha = (normalized * 255).round();
+      stops: _sampledStops,
+      colors: _sampledStrengths.map((strength) {
+        final weight = _layerWeight(strength, layerStrength);
+        final alpha = (weight * 255).round();
 
         return Color.fromARGB(alpha, 255, 255, 255);
       }).toList(),
+    );
+  }
+
+  List<double> get _sampledStops {
+    return List<double>.generate(
+      _gradientSampleCount,
+      (index) => index / (_gradientSampleCount - 1),
+    );
+  }
+
+  List<double> get _sampledStrengths {
+    return _sampledStops.map((stop) {
+      return _shaderStrength(_sampleGradientValue(stop));
+    }).toList();
+  }
+
+  double _sampleGradientValue(double stop) {
+    final stops = linearGradientBlur.stops;
+    final values = linearGradientBlur.values;
+
+    if (stop <= stops.first) {
+      return values.first;
+    }
+
+    if (stop >= stops.last) {
+      return values.last;
+    }
+
+    for (var i = 1; i < stops.length; i++) {
+      final previousStop = stops[i - 1];
+      final nextStop = stops[i];
+
+      if (stop <= nextStop) {
+        final previousValue = values[i - 1];
+        final nextValue = values[i];
+        final range = nextStop - previousStop;
+
+        if (range <= 0) {
+          return nextValue;
+        }
+
+        final t = (stop - previousStop) / range;
+        return ui.lerpDouble(previousValue, nextValue, t) ?? nextValue;
+      }
+    }
+
+    return values.last;
+  }
+
+  double _layerWeight(double strength, double layerStrength) {
+    const bandWidth = 1 / _layerCount;
+    return (1 - ((strength - layerStrength).abs() / bandWidth)).clamp(
+      0.0,
+      1.0,
     );
   }
 
