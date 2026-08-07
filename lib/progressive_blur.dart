@@ -273,7 +273,7 @@ class _LayeredGradientProgressiveBlurWidget extends StatelessWidget {
                   colors: linearGradientBlur.values
                       .map(
                         (value) => tintColor.withValues(
-                          alpha: tintColor.a * value.clamp(0.0, 1.0),
+                          alpha: tintColor.a * _shaderStrength(value),
                         ),
                       )
                       .toList(),
@@ -297,12 +297,21 @@ class _LayeredGradientProgressiveBlurWidget extends StatelessWidget {
       end: linearGradientBlur.end,
       stops: linearGradientBlur.stops,
       colors: linearGradientBlur.values.map((value) {
-        final normalized = ((value - lower) / (upper - lower)).clamp(0.0, 1.0);
+        final strength = _shaderStrength(value);
+        final normalized = ((strength - lower) / (upper - lower)).clamp(
+          0.0,
+          1.0,
+        );
         final alpha = (normalized * 255).round();
 
         return Color.fromARGB(alpha, 255, 255, 255);
       }).toList(),
     );
+  }
+
+  double _shaderStrength(double value) {
+    final clamped = value.clamp(0.0, 1.0);
+    return clamped * clamped;
   }
 }
 
