@@ -48,12 +48,27 @@ class ProgressiveBlurWidget extends StatefulWidget {
   ///
   /// This avoids Android shader artifacts caused by the two-pass variable blur
   /// path. Set this to `false` if you need to compare against the shader path.
-  static bool useAndroidLayeredGradientBlur = true;
+  static bool useAndroidLayeredGradientBlur = false;
+
+  static ui.FragmentProgram? _program;
+  static Future<void>? _programLoad;
+
+  static Future<void> _loadProgram() {
+    if (_program != null) {
+      return Future<void>.value();
+    }
+
+    return _programLoad ??= ui.FragmentProgram.fromAsset(_shaderAssetKey).then(
+      (program) {
+        _program = program;
+      },
+    );
+  }
 
   /// Precaches the blur shader so that it can be used synchronously later.
   /// This should be called as early as possible in your app (e.g. in `main()`).
   static Future<void> precache() {
-    return ShaderBuilder.precacheShader(_shaderAssetKey);
+    return _loadProgram();
   }
 
   /// A simple constructor that allows to specify a linear gradient blur.
@@ -84,11 +99,13 @@ class ProgressiveBlurWidget extends StatefulWidget {
 class _ProgressiveBlurWidgetState extends State<ProgressiveBlurWidget> {
   /// The blur texture that this widget manages.
   ui.Image? _managedBlurTexture;
+  Future<void>? _programLoad;
 
   @override
   void initState() {
     super.initState();
     _maybeCreateBlurTexture();
+    _maybeLoadProgram();
   }
 
   /// Disposes of the old blur texture and creates a new one if necessary.
@@ -127,6 +144,21 @@ class _ProgressiveBlurWidgetState extends State<ProgressiveBlurWidget> {
     if (shouldCreateBlurTexture) {
       _maybeCreateBlurTexture();
     }
+
+    _maybeLoadProgram();
+  }
+
+  void _maybeLoadProgram() {
+    if (ProgressiveBlurWidget._program != null || _programLoad != null) {
+      return;
+    }
+
+    _programLoad = ProgressiveBlurWidget._loadProgram().whenComplete(() {
+      _programLoad = null;
+      if (mounted) {
+        setState(() {});
+      }
+    });
   }
 
   @override
@@ -154,62 +186,149 @@ class _ProgressiveBlurWidgetState extends State<ProgressiveBlurWidget> {
       );
     }
 
-    // The output texture should be scaled by the device pixel ratio.
-    final devicePixelRatio = MediaQuery.devicePixelRatioOf(context);
+    final program = ProgressiveBlurWidget._program;
+
+    if (program == null) {
+      _maybeLoadProgram();
+      return RepaintBoundary(child: widget.child);
+    }
 
     return RepaintBoundary(
-      child: ShaderBuilder(
-        (context, shader, child) {
-          return AnimatedSampler(
-            (image, size, canvas) {
-              final scaledSize = size * devicePixelRatio;
-
-              // First do X-axis pass
-              final firstPassRecorder = ui.PictureRecorder();
-              final firstPassCanvas = Canvas(firstPassRecorder);
-
-              shader.setImageSampler(0, image); // child_texture
-              shader.setImageSampler(1, blurTexture); // blur_texture
-
-              shader.setFloat(0, scaledSize.width); // child_size.x
-              shader.setFloat(1, scaledSize.height); // child_size.y
-              shader.setFloat(2, widget.sigma); // blur_sigma
-              shader.setFloat(3, 0.0); // blur_direction
-              shader.setFloat(4, widget.tintColor.r); // tint.r
-              shader.setFloat(5, widget.tintColor.g); // tint.g
-              shader.setFloat(6, widget.tintColor.b); // tint.b
-              shader.setFloat(7, widget.tintColor.a); // tint.a
-
-              // Draw the first pass
-              final paint = Paint()..shader = shader;
-              firstPassCanvas.drawRect(Offset.zero & scaledSize, paint);
-
-              // End the first pass and get the image reference
-              final firstPassPicture = firstPassRecorder.endRecording();
-              final firstPassImage = firstPassPicture.toImageSync(
-                scaledSize.width.ceil(),
-                scaledSize.height.ceil(),
-              );
-
-              // Then do Y-axis pass
-              shader.setImageSampler(0, firstPassImage); // child_texture
-              shader.setFloat(3, 1.0); // blur_direction
-
-              // Scale the canvas back so that we can apply the pixel ratio
-              // scaling.
-              canvas.scale(1 / devicePixelRatio);
-              canvas.drawRect(Offset.zero & scaledSize, paint);
-
-              // Dispose the first pass resources.
-              firstPassPicture.dispose();
-              firstPassImage.dispose();
-            },
-            child: child!,
-          );
-        },
-        assetKey: ProgressiveBlurWidget._shaderAssetKey,
+      child: _ShaderProgressiveBlurWidget(
+        program: program,
+        blurTexture: blurTexture,
+        sigma: widget.sigma,
+        tintColor: widget.tintColor,
         child: widget.child,
       ),
+    );
+  }
+}
+
+class _ShaderProgressiveBlurWidget extends StatefulWidget {
+  const _ShaderProgressiveBlurWidget({
+    required this.program,
+    required this.blurTexture,
+    required this.sigma,
+    required this.tintColor,
+    required this.child,
+  });
+
+  final ui.FragmentProgram program;
+  final ui.Image blurTexture;
+  final double sigma;
+  final Color tintColor;
+  final Widget child;
+
+  @override
+  State<_ShaderProgressiveBlurWidget> createState() =>
+      _ShaderProgressiveBlurWidgetState();
+}
+
+class _ShaderProgressiveBlurWidgetState
+    extends State<_ShaderProgressiveBlurWidget> {
+  late ui.FragmentShader _xShader;
+  late ui.FragmentShader _yShader;
+
+  @override
+  void initState() {
+    super.initState();
+    _createShaders();
+  }
+
+  @override
+  void didUpdateWidget(covariant _ShaderProgressiveBlurWidget oldWidget) {
+    super.didUpdateWidget(oldWidget);
+
+    if (widget.program != oldWidget.program) {
+      _xShader.dispose();
+      _yShader.dispose();
+      _createShaders();
+    }
+  }
+
+  @override
+  void dispose() {
+    _xShader.dispose();
+    _yShader.dispose();
+    super.dispose();
+  }
+
+  void _createShaders() {
+    _xShader = widget.program.fragmentShader();
+    _yShader = widget.program.fragmentShader();
+  }
+
+  void _setUniforms(
+    ui.FragmentShader shader, {
+    required ui.Image childTexture,
+    required Size childSize,
+    required double direction,
+  }) {
+    shader.setImageSampler(0, childTexture);
+    shader.setImageSampler(1, widget.blurTexture);
+    shader.setFloat(0, childSize.width);
+    shader.setFloat(1, childSize.height);
+    shader.setFloat(2, widget.sigma);
+    shader.setFloat(3, direction);
+    shader.setFloat(4, widget.tintColor.r);
+    shader.setFloat(5, widget.tintColor.g);
+    shader.setFloat(6, widget.tintColor.b);
+    shader.setFloat(7, widget.tintColor.a);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedSampler(
+      (image, size, canvas) {
+        final imageSize = Size(
+          image.width.toDouble(),
+          image.height.toDouble(),
+        );
+
+        final firstPassRecorder = ui.PictureRecorder();
+        final firstPassCanvas = Canvas(firstPassRecorder);
+
+        _setUniforms(
+          _xShader,
+          childTexture: image,
+          childSize: imageSize,
+          direction: 0.0,
+        );
+
+        firstPassCanvas.drawRect(
+          Offset.zero & imageSize,
+          Paint()..shader = _xShader,
+        );
+
+        final firstPassPicture = firstPassRecorder.endRecording();
+        final firstPassImage = firstPassPicture.toImageSync(
+          image.width,
+          image.height,
+        );
+
+        try {
+          _setUniforms(
+            _yShader,
+            childTexture: firstPassImage,
+            childSize: imageSize,
+            direction: 1.0,
+          );
+
+          canvas.scale(
+            size.width / image.width,
+            size.height / image.height,
+          );
+          canvas.drawRect(
+            Offset.zero & imageSize,
+            Paint()..shader = _yShader,
+          );
+        } finally {
+          firstPassPicture.dispose();
+          firstPassImage.dispose();
+        }
+      },
+      child: widget.child,
     );
   }
 }

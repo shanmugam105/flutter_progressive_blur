@@ -47,7 +47,8 @@ void main() {
     vec2 offset = vec2(float(v)) / child_size;
     offset *= dir;
 
-    color += texture(child_texture, uv + offset) * weight;
+    vec2 sample_uv = clamp(uv + offset, vec2(0.0), vec2(1.0));
+    color += texture(child_texture, sample_uv) * weight;
   }
 
   vec4 blurred = color / total_weight;
